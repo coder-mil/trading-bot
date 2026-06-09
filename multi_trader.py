@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Multi-Coin Trading Bot
-Analyzes and trades multiple low-price, high-volatility assets simultaneously.
+Multi-Coin Trading Bot v2
+Improved: EMA(20/50), ATR-based TP/SL, real MACD, volume filter, BTC trend filter
 Simulation mode: no real Binance orders.
 """
 
@@ -41,31 +41,38 @@ load_dotenv("/root/trading-bot/.env")
 class Config:
     BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
     BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "")
-    
+
     INITIAL_BUDGET = float(os.getenv("TRADING_BUDGET", "14.74"))
     SIMULATE_MODE = True  # Simulation — no real trades
-    
-    # Risk management
     MAX_POSITION_SIZE = 0.10  # 10% per coin
-    STOP_LOSS_PCT = 0.02      # -2%
-    TAKE_PROFIT_PCT = 0.04    # +4%
-    
-    # Indicators
+
+    # --- Risk management (ATR-based) ---
+    ATR_PERIOD = 14
+    ATR_TP_MULT = 2.0    # Take Profit: entry + 2 × ATR
+    ATR_SL_MULT = 1.0    # Stop Loss: entry - 1 × ATR
+    ATR_TRAIL_MULT = 1.0 # Trailing stop activation: 2 × ATR above entry
+    ATR_TRAIL_OFFSET = 1.0  # Trail 1 × ATR below highest price
+
+    # --- Indicators ---
     RSI_PERIOD = 14
-    MA_SHORT = 20
-    MA_LONG = 50
+    MA_SHORT = 20   # EMA period
+    MA_LONG = 50    # EMA period
     MACD_FAST = 12
     MACD_SLOW = 26
     MACD_SIGNAL = 9
-    
-    # Timing
+
+    # --- Filters ---
+    VOLUME_THRESHOLD = 1.2  # Volume must be > 1.2× average 20 to confirm signal
+    BTC_TREND_THRESHOLD = 0.03  # Ignore BUY if BTC dropped >3% in last 4h
+
+    # --- Timing ---
     CANDLE_INTERVAL = "1h"
     COOLDOWN_MINUTES = 30
-    
-    # Database
+
+    # --- Database ---
     DB_PATH = "/root/trading-bot/trades.db"
-    
-    # Telegram
+
+    # --- Telegram ---
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -82,6 +89,11 @@ def send_telegram_message(text: str) -> bool:
         import urllib.request
         import urllib.parse
         url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage"
+        # Escape HTML entities in text
+        text = (text
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;"))
         data = urllib.parse.urlencode({
             "chat_id": Config.TELEGRAM_CHAT_ID,
             "text": text,
@@ -102,6 +114,69 @@ def send_telegram_message(text: str) -> bool:
 class TradeDatabase:
     def __init__(self, db_path: str):
         self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS coins (
+                symbol TEXT PRIMARY KEY,
+                enabled INTEGER DEFAULT 1,
+                position_size REAL DEFAULT 0.10,
+                last_signal TEXT,
+                last_signal_time TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS positions (
+                symbol TEXT PRIMARY KEY,
+                side TEXT,
+                entry_price REAL,
+                quantity REAL,
+                atr REAL,
+                highest_price REAL,
+                trailing_activated INTEGER DEFAULT 0,
+                created_at TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                price REAL NOT NULL,
+                quantity REAL NOT NULL,
+                value REAL NOT NULL,
+                fee REAL,
+                strategy TEXT,
+                pnl REAL,
+                pnl_pct REAL,
+                notes TEXT
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                signal_type TEXT NOT NULL,
+                price REAL NOT NULL,
+                rsi REAL,
+                ma_short REAL,
+                ma_long REAL,
+                macd_histogram REAL,
+                atr REAL,
+                volume_ratio REAL,
+                btc_change REAL,
+                strength REAL,
+                action TEXT,
+                executed BOOLEAN DEFAULT 0
+            )
+        """)
+        conn.commit()
+        conn.close()
 
     def get_enabled_coins(self) -> List[str]:
         conn = sqlite3.connect(self.db_path)
@@ -114,25 +189,41 @@ class TradeDatabase:
     def get_position(self, symbol: str) -> Optional[Dict]:
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
-        c.execute("SELECT symbol, side, entry_price, quantity, created_at FROM positions WHERE symbol = ?", (symbol,))
+        c.execute("""
+            SELECT symbol, side, entry_price, quantity, atr, highest_price,
+                   trailing_activated, created_at
+            FROM positions WHERE symbol = ?
+        """, (symbol,))
         row = c.fetchone()
         conn.close()
         if row:
-            return {"symbol": row[0], "side": row[1], "entry_price": row[2], "quantity": row[3], "created_at": row[4]}
+            return {
+                "symbol": row[0], "side": row[1], "entry_price": row[2],
+                "quantity": row[3], "atr": row[4], "highest_price": row[5],
+                "trailing_activated": bool(row[6]), "created_at": row[7]
+            }
         return None
 
     def upsert_position(self, position: Dict) -> None:
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         c.execute("""
-            INSERT INTO positions (symbol, side, entry_price, quantity, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO positions (symbol, side, entry_price, quantity, atr,
+                                  highest_price, trailing_activated, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 side = excluded.side,
                 entry_price = excluded.entry_price,
                 quantity = excluded.quantity,
+                atr = excluded.atr,
+                highest_price = excluded.highest_price,
+                trailing_activated = excluded.trailing_activated,
                 created_at = excluded.created_at
-        """, (position['symbol'], position['side'], position['entry_price'], position['quantity'], position['created_at']))
+        """, (position['symbol'], position['side'], position['entry_price'],
+              position['quantity'], position.get('atr', 0),
+              position.get('highest_price', position['entry_price']),
+              1 if position.get('trailing_activated') else 0,
+              position['created_at']))
         conn.commit()
         conn.close()
 
@@ -147,14 +238,13 @@ class TradeDatabase:
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         c.execute("""
-            INSERT INTO trades (timestamp, symbol, side, price, quantity, value, fee, strategy, pnl, pnl_pct, notes)
+            INSERT INTO trades (timestamp, symbol, side, price, quantity, value,
+                               fee, strategy, pnl, pnl_pct, notes)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            trade['timestamp'], trade['symbol'], trade['side'],
-            trade['price'], trade['quantity'], trade['value'],
-            trade.get('fee', 0), trade.get('strategy', ''),
-            trade.get('pnl'), trade.get('pnl_pct'), trade.get('notes', '')
-        ))
+        """, (trade['timestamp'], trade['symbol'], trade['side'],
+              trade['price'], trade['quantity'], trade['value'],
+              trade.get('fee', 0), trade.get('strategy', ''),
+              trade.get('pnl'), trade.get('pnl_pct'), trade.get('notes', '')))
         conn.commit()
         conn.close()
 
@@ -162,15 +252,16 @@ class TradeDatabase:
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         c.execute("""
-            INSERT INTO signals (timestamp, symbol, signal_type, price, rsi, ma_short, ma_long, volume_ratio, strength, action, executed)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            signal['timestamp'], signal['symbol'], signal['signal_type'],
-            signal['price'], signal.get('rsi'), signal.get('ma_short'),
-            signal.get('ma_long'), signal.get('volume_ratio'),
-            signal.get('strength', 0), signal['action'],
-            signal.get('executed', 0)
-        ))
+            INSERT INTO signals (timestamp, symbol, signal_type, price, rsi,
+                               ma_short, ma_long, macd_histogram, atr,
+                               volume_ratio, btc_change, strength, action, executed)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (signal['timestamp'], signal['symbol'], signal['signal_type'],
+              signal['price'], signal.get('rsi'), signal.get('ma_short'),
+              signal.get('ma_long'), signal.get('macd_histogram'),
+              signal.get('atr'), signal.get('volume_ratio'),
+              signal.get('btc_change'), signal.get('strength', 0),
+              signal['action'], signal.get('executed', 0)))
         conn.commit()
         conn.close()
 
@@ -188,17 +279,13 @@ class TradeDatabase:
         return None
 
     def get_total_balance(self) -> float:
-        """Get total USDT balance. Falls back to env var if API fails."""
-        # Try env var first (set manually or updated by trades)
         env_balance = os.getenv("TRADING_BUDGET", "")
         if env_balance:
             return float(env_balance)
-        # Try API
         client = BinanceClient()
         balance = client.get_balance("USDT")
         if balance > 0:
             return balance
-        # Fallback: return 0 (user checks manually)
         return 0.0
 
 
@@ -236,6 +323,20 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Error fetching klines for {symbol}: {e}")
             return []
+
+    def get_btc_4h_change(self) -> float:
+        """Returns BTCUSDT % change over last 4 hours (4 × 1h candles)."""
+        try:
+            klines = self.get_klines("BTCUSDT", interval="1h", limit=5)
+            if len(klines) < 5:
+                return 0.0
+            # Use close prices: current vs 4 candles ago
+            current = float(klines[-1][4])
+            past = float(klines[-5][4])
+            return (current - past) / past
+        except Exception as e:
+            logger.warning(f"BTC trend check failed: {e}")
+            return 0.0
 
     def get_balance(self, asset: str = "USDT") -> float:
         import hmac, hashlib
@@ -282,7 +383,7 @@ class BinanceClient:
 
 
 # ============================================================
-# INDICATORS
+# TECHNICAL INDICATORS (v2)
 # ============================================================
 
 class TechnicalIndicators:
@@ -301,63 +402,134 @@ class TechnicalIndicators:
         return 100 - (100 / (1 + rs))
 
     @staticmethod
-    def calculate_ma(prices: List[float], period: int) -> float:
-        if len(prices) < period:
-            return prices[-1] if prices else 0.0
-        return float(np.mean(prices[-period:]))
-
-    @staticmethod
-    def calculate_macd(prices: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> tuple:
-        if len(prices) < slow + signal:
-            return 0.0, 0.0, 0.0
-        ema_fast = TechnicalIndicators._ema(prices, fast)
-        ema_slow = TechnicalIndicators._ema(prices, slow)
-        macd_line = ema_fast - ema_slow
-        signal_line = macd_line * 0.9
-        histogram = macd_line - signal_line
-        return macd_line, signal_line, histogram
-
-    @staticmethod
-    def _ema(prices: List[float], period: int) -> float:
+    def calculate_ema(prices: List[float], period: int) -> float:
+        """Exponential Moving Average — more responsive than SMA."""
         if len(prices) < period:
             return prices[-1] if prices else 0.0
         multiplier = 2 / (period + 1)
-        ema = sum(prices[:period]) / period
+        ema = float(np.mean(prices[:period]))
         for price in prices[period:]:
             ema = (price - ema) * multiplier + ema
         return ema
 
+    @staticmethod
+    def calculate_macd(prices: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> tuple:
+        """
+        Real MACD with EMA signal line.
+        Returns: (macd_line, signal_line, histogram)
+        """
+        if len(prices) < slow + signal:
+            return 0.0, 0.0, 0.0
+        ema_fast = TechnicalIndicators.calculate_ema(prices, fast)
+        ema_slow = TechnicalIndicators.calculate_ema(prices, slow)
+        macd_line = ema_fast - ema_slow
+        # Real MACD signal line: EMA of MACD line over `signal` periods
+        # Build MACD series to compute EMA on it
+        macd_series = []
+        for i in range(len(prices)):
+            ef = TechnicalIndicators.calculate_ema(prices[:i+1], fast) if i >= fast else float(np.mean(prices[:i+1]))
+            es = TechnicalIndicators.calculate_ema(prices[:i+1], slow) if i >= slow else float(np.mean(prices[:i+1]))
+            macd_series.append(ef - es)
+        # EMA of MACD series (need at least `signal` values)
+        if len(macd_series) < signal:
+            signal_line = macd_line * 0.9
+        else:
+            # Compute EMA of MACD line
+            macd_ema_start = np.mean(macd_series[-signal:])
+            mult = 2 / (signal + 1)
+            signal_line = macd_ema_start
+            for v in macd_series[-signal:]:
+                signal_line = (v - signal_line) * mult + signal_line
+        histogram = macd_line - signal_line
+        return macd_line, signal_line, histogram
+
+    @staticmethod
+    def calculate_atr(klines: List, period: int = 14) -> float:
+        """
+        Average True Range — measures volatility.
+        Uses high, low, close from klines (Binance format).
+        """
+        if len(klines) < period + 1:
+            return 0.0
+        trs = []
+        for i in range(1, len(klines)):
+            high = float(klines[i][2])   # high
+            low = float(klines[i][3])   # low
+            prev_close = float(klines[i-1][4])  # previous close
+            tr = max(high - low,
+                     abs(high - prev_close),
+                     abs(low - prev_close))
+            trs.append(tr)
+        if len(trs) < period:
+            return 0.0
+        return float(np.mean(trs[-period:]))
+
+    @staticmethod
+    def calculate_volume_ratio(volumes: List[float], period: int = 20) -> float:
+        """Volume relative to 20-period average."""
+        if len(volumes) < period:
+            return 1.0
+        avg_volume = float(np.mean(volumes[-period:]))
+        current_volume = volumes[-1]
+        return current_volume / avg_volume if avg_volume > 0 else 1.0
+
 
 # ============================================================
-# STRATEGY
+# STRATEGY (v2)
 # ============================================================
 
 class Strategy:
     def __init__(self):
         self.indicators = TechnicalIndicators()
 
-    def analyze(self, prices: List[float], volumes: List[float]) -> dict:
-        if len(prices) < max(Config.MA_LONG, Config.RSI_PERIOD + 1):
-            return {"action": "HOLD", "reason": "Insufficient data"}
+    def analyze(self, prices: List[float], volumes: List[float],
+                klines: List, btc_change: float = 0.0) -> dict:
+        """
+        btc_change: BTCUSDT % change over last 4h (from BinanceClient).
+        """
+        min_data = max(Config.MA_LONG, Config.RSI_PERIOD + 1, Config.ATR_PERIOD + 1)
+        if len(prices) < min_data:
+            return {"action": "HOLD", "reason": "Insufficient data",
+                    "rsi": 50, "atr": 0, "volume_ratio": 1, "price": prices[-1] if prices else 0}
 
         current_price = prices[-1]
         rsi = self.indicators.calculate_rsi(prices, Config.RSI_PERIOD)
-        ma_short = self.indicators.calculate_ma(prices, Config.MA_SHORT)
-        ma_long = self.indicators.calculate_ma(prices, Config.MA_LONG)
+        # EMA (not SMA)
+        ma_short = self.indicators.calculate_ema(prices, Config.MA_SHORT)
+        ma_long = self.indicators.calculate_ema(prices, Config.MA_LONG)
         macd_line, signal_line, histogram = self.indicators.calculate_macd(
             prices, Config.MACD_FAST, Config.MACD_SLOW, Config.MACD_SIGNAL
         )
+        atr = self.indicators.calculate_atr(klines, Config.ATR_PERIOD)
+        volume_ratio = self.indicators.calculate_volume_ratio(volumes)
 
-        # ALL 3 conditions must agree
-        buy_conditions = (rsi < 30) and (ma_short > ma_long) and (histogram > 0)
-        sell_conditions = (rsi > 70) and (ma_short < ma_long) and (histogram < 0)
+        # --- Filters ---
+        btc_filter_blocked = (btc_change < -Config.BTC_TREND_THRESHOLD)
+        volume_confirmed = (volume_ratio >= Config.VOLUME_THRESHOLD)
 
-        if buy_conditions:
+        # ALL base conditions must agree
+        buy_base = (rsi < 30) and (ma_short > ma_long) and (histogram > 0)
+        sell_base = (rsi > 70) and (ma_short < ma_long) and (histogram < 0)
+
+        # Apply BTC trend filter on BUY
+        if buy_base and btc_filter_blocked:
+            buy_base = False
+            reason_btc = f"⛔ BTC -{(abs(btc_change)*100):.1f}% 4h (compra suspensa)"
+        else:
+            reason_btc = ""
+
+        # Volume confirmation (weaken signal if volume is low — still shows but notes it)
+        vol_note = f" | 📊 vol {volume_ratio:.1f}×" if volume_ratio >= Config.VOLUME_THRESHOLD else f" | ⚠️ vol {volume_ratio:.1f}×"
+
+        if buy_base:
             action = "BUY"
-        elif sell_conditions:
+        elif sell_base:
             action = "SELL"
         else:
             action = "HOLD"
+
+        reason = self._build_reason(rsi, ma_short, ma_long, histogram,
+                                     atr, btc_change, reason_btc, vol_note)
 
         return {
             "action": action,
@@ -366,10 +538,17 @@ class Strategy:
             "ma_short": ma_short,
             "ma_long": ma_long,
             "macd_histogram": histogram,
-            "reason": self._build_reason(rsi, ma_short, ma_long, histogram)
+            "atr": atr,
+            "volume_ratio": volume_ratio,
+            "btc_change": btc_change,
+            "btc_filter_blocked": btc_filter_blocked,
+            "volume_confirmed": volume_confirmed,
+            "reason": reason
         }
 
-    def _build_reason(self, rsi: float, ma_short: float, ma_long: float, histogram: float) -> str:
+    def _build_reason(self, rsi: float, ma_short: float, ma_long: float,
+                      histogram: float, atr: float, btc_change: float,
+                      btc_note: str, vol_note: str) -> str:
         parts = []
         if rsi < 30:
             parts.append(f"RSI {rsi:.1f} < 30 (sobrevenda)")
@@ -378,41 +557,45 @@ class Strategy:
         else:
             parts.append(f"RSI {rsi:.1f}")
         if ma_short > ma_long:
-            parts.append("MA(20) above MA(50) ☝️")
+            parts.append("EMA(20) > EMA(50) ☝️")
         elif ma_short < ma_long:
-            parts.append("MA(20) below MA(50) 👇")
+            parts.append("EMA(20) < EMA(50) 👇")
         if histogram > 0:
             parts.append("MACD hist +▲")
         elif histogram < 0:
             parts.append("MACD hist -▼")
+        if atr > 0:
+            parts.append(f"ATR ${atr:.4f}")
+        parts.append(f"BTC {'+' if btc_change >= 0 else ''}{(btc_change*100):.1f}% 4h")
+        if btc_note:
+            parts.append(btc_note)
+        parts.append(vol_note)
         return " | ".join(parts)
 
 
 # ============================================================
-# PER-COIN TRADER
+# PER-COIN TRADER (v2 — ATR trailing stop)
 # ============================================================
 
 class CoinTrader:
-    """Manages analysis and trading for a single coin."""
-
     def __init__(self, symbol: str, db: TradeDatabase):
         self.symbol = symbol
         self.db = db
         self.binance = BinanceClient()
         self.strategy = Strategy()
 
-    def analyze(self) -> dict:
+    def analyze(self, btc_change: float = 0.0) -> dict:
         klines = self.binance.get_klines(self.symbol, interval=Config.CANDLE_INTERVAL, limit=100)
         if not klines:
-            return {"action": "HOLD", "reason": "API error", "rsi": 50, "price": 0}
+            return {"action": "HOLD", "reason": "API error", "rsi": 50, "atr": 0, "price": 0}
         prices = [float(k[4]) for k in klines]
         volumes = [float(k[5]) for k in klines]
-        return self.strategy.analyze(prices, volumes)
+        return self.strategy.analyze(prices, volumes, klines, btc_change)
 
     def get_position(self) -> Optional[Dict]:
         return self.db.get_position(self.symbol)
 
-    def execute_buy(self, price: float, quote_balance: float) -> dict:
+    def execute_buy(self, price: float, quote_balance: float, atr: float) -> dict:
         position_size = quote_balance * Config.MAX_POSITION_SIZE
         quantity = position_size / price
 
@@ -422,10 +605,14 @@ class CoinTrader:
                 "side": "LONG",
                 "entry_price": price,
                 "quantity": quantity,
+                "atr": atr,
+                "highest_price": price,
+                "trailing_activated": False,
                 "created_at": datetime.now().isoformat()
             })
-            logger.info(f"[SIM] BUY {self.symbol}: {quantity} @ {price}")
-            return {"status": "simulated", "side": "BUY", "price": price, "quantity": quantity}
+            logger.info(f"[SIM] BUY {self.symbol}: {quantity} @ {price} | ATR ${atr:.4f}")
+            return {"status": "simulated", "side": "BUY", "price": price,
+                    "quantity": quantity, "atr": atr}
 
         order = self.binance.place_order("BUY", quantity, self.symbol)
         if order and "orderId" in order:
@@ -434,12 +621,16 @@ class CoinTrader:
                 "side": "LONG",
                 "entry_price": price,
                 "quantity": quantity,
+                "atr": atr,
+                "highest_price": price,
+                "trailing_activated": False,
                 "created_at": datetime.now().isoformat()
             })
-            return {"status": "success", "side": "BUY", "price": price, "quantity": quantity}
+            return {"status": "success", "side": "BUY", "price": price,
+                    "quantity": quantity, "atr": atr}
         return {"status": "error"}
 
-    def execute_sell(self, price: float) -> dict:
+    def execute_sell(self, price: float, reason: str = "") -> dict:
         position = self.get_position()
         if not position:
             return {"status": "skipped", "reason": "No position"}
@@ -451,8 +642,21 @@ class CoinTrader:
 
         if Config.SIMULATE_MODE:
             self.db.remove_position(self.symbol)
-            logger.info(f"[SIM] SELL {self.symbol}: {quantity} @ {price}, PnL: {pnl:.4f} ({pnl_pct:.2f}%)")
-            return {"status": "simulated", "side": "SELL", "price": price, "pnl": pnl, "pnl_pct": pnl_pct}
+            logger.info(f"[SIM] SELL {self.symbol}: {quantity} @ {price}, "
+                        f"PnL: {pnl:.4f} ({pnl_pct:.2f}%) | {reason}")
+            self.db.record_trade({
+                "timestamp": datetime.now().isoformat(),
+                "symbol": self.symbol,
+                "side": "SELL",
+                "price": price,
+                "quantity": quantity,
+                "value": price * quantity,
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+                "notes": reason
+            })
+            return {"status": "simulated", "side": "SELL", "price": price,
+                    "pnl": pnl, "pnl_pct": pnl_pct, "reason": reason}
 
         order = self.binance.place_order("SELL", quantity, self.symbol)
         if order and "orderId" in order:
@@ -465,28 +669,67 @@ class CoinTrader:
                 "quantity": quantity,
                 "value": price * quantity,
                 "pnl": pnl,
-                "pnl_pct": pnl_pct
+                "pnl_pct": pnl_pct,
+                "notes": reason
             })
-            return {"status": "success", "side": "SELL", "price": price, "pnl": pnl, "pnl_pct": pnl_pct}
+            return {"status": "success", "side": "SELL", "price": price,
+                    "pnl": pnl, "pnl_pct": pnl_pct, "reason": reason}
         return {"status": "error"}
 
-    def check_sl_tp(self, price: float) -> Optional[dict]:
+    def check_trailing_stop(self, current_price: float) -> Optional[dict]:
+        """
+        ATR-based trailing stop:
+        - Initial SL: entry - ATR_SL_MULT × ATR
+        - Activate trailing when price > entry + ATR_TRAIL_MULT × ATR
+        - Trail: highest - ATR_TRAIL_OFFSET × ATR
+        """
         position = self.get_position()
         if not position or position["side"] != "LONG":
             return None
+
         entry_price = position["entry_price"]
-        pnl_pct = (price - entry_price) / entry_price
-        if pnl_pct <= -Config.STOP_LOSS_PCT:
-            logger.info(f"{self.symbol}: Stop loss triggered ({pnl_pct:.2f}%)")
-            return self.execute_sell(price)
-        if pnl_pct >= Config.TAKE_PROFIT_PCT:
-            logger.info(f"{self.symbol}: Take profit triggered ({pnl_pct:.2f}%)")
-            return self.execute_sell(price)
+        atr = position.get("atr", 0)
+        highest = position.get("highest_price", entry_price)
+
+        if atr <= 0:
+            # Fallback to fixed percentage if no ATR
+            pnl_pct = (current_price - entry_price) / entry_price
+            if pnl_pct <= -0.02:
+                return self.execute_sell(current_price, "SL 2% (no ATR)")
+            if pnl_pct >= 0.04:
+                return self.execute_sell(current_price, "TP 4% (no ATR)")
+            return None
+
+        # Update highest price
+        if current_price > highest:
+            highest = current_price
+
+        initial_sl = entry_price - Config.ATR_SL_MULT * atr
+        activation_price = entry_price + Config.ATR_TRAIL_MULT * atr
+        trailing_stop = highest - Config.ATR_TRAIL_OFFSET * atr
+
+        # Check if trailing is activated
+        trailing_activated = (current_price >= activation_price)
+        effective_stop = trailing_stop if trailing_activated else initial_sl
+
+        # Update highest in DB
+        self.db.upsert_position({
+            **position,
+            "highest_price": highest,
+            "trailing_activated": trailing_activated
+        })
+
+        # Check stop triggers
+        if current_price <= initial_sl:
+            return self.execute_sell(current_price, f"SL ${initial_sl:.4f} (ATR)")
+        if trailing_activated and current_price <= trailing_stop:
+            return self.execute_sell(current_price, f"TRAIL STOP ${trailing_stop:.4f} (ATR)")
+
         return None
 
 
 # ============================================================
-# MULTI-TRADER ORCHESTRATOR
+# MULTI-TRADER ORCHESTRATOR (v2)
 # ============================================================
 
 class MultiTrader:
@@ -494,13 +737,17 @@ class MultiTrader:
         self.db = TradeDatabase(Config.DB_PATH)
         self.coins = self.db.get_enabled_coins()
         self.traders = {symbol: CoinTrader(symbol, self.db) for symbol in self.coins}
-        self.coin_results = {}  # symbol -> result dict
+        self.coin_results = {}
+
+        # Fetch BTC trend once for all coins
+        btc_client = BinanceClient()
+        self.btc_change = btc_client.get_btc_4h_change()
 
     def analyze_all(self) -> Dict[str, dict]:
         results = {}
         for symbol in self.coins:
             trader = self.traders[symbol]
-            analysis = trader.analyze()
+            analysis = trader.analyze(btc_change=self.btc_change)
             position = trader.get_position()
             current_price = analysis.get("price", 0)
 
@@ -516,10 +763,10 @@ class MultiTrader:
                 analysis["action"] = "HOLD"
                 analysis["reason"] += " | ⏳ Cooldown 30min"
 
-            # Check SL/TP if position open
+            # Check trailing stop if position open
             sl_tp_result = None
             if position and position["side"] == "LONG":
-                sl_tp_result = trader.check_sl_tp(current_price)
+                sl_tp_result = trader.check_trailing_stop(current_price)
 
             # Record signal
             self.db.record_signal({
@@ -530,7 +777,10 @@ class MultiTrader:
                 "rsi": analysis.get("rsi"),
                 "ma_short": analysis.get("ma_short"),
                 "ma_long": analysis.get("ma_long"),
-                "volume_ratio": None,
+                "macd_histogram": analysis.get("macd_histogram"),
+                "atr": analysis.get("atr"),
+                "volume_ratio": analysis.get("volume_ratio"),
+                "btc_change": analysis.get("btc_change"),
                 "strength": 0,
                 "action": analysis["action"]
             })
@@ -554,16 +804,16 @@ class MultiTrader:
 
             action = analysis.get("action")
             price = analysis.get("price", 0)
+            atr = analysis.get("atr", 0)
 
             trade_result = None
             if action == "BUY" and position is None:
-                trade_result = trader.execute_buy(price, quote_balance)
+                trade_result = trader.execute_buy(price, quote_balance, atr)
             elif action == "SELL" and position and position["side"] == "LONG":
-                trade_result = trader.execute_sell(price)
+                trade_result = trader.execute_sell(price, "Signal SELL")
 
             if trade_result:
                 results[symbol] = trade_result
-                # Refresh position after trade
                 self.coin_results[symbol]["position"] = trader.get_position()
 
         return results
@@ -581,6 +831,12 @@ class MultiTrader:
                 pnl_pct = (current_price - position["entry_price"]) / position["entry_price"] * 100
                 coin_value = position["quantity"] * current_price
                 total_value += coin_value
+                atr = position.get("atr", 0)
+                tp_price = position["entry_price"] + Config.ATR_TP_MULT * atr
+                sl_price = position["entry_price"] - Config.ATR_SL_MULT * atr
+                trailing_act = position.get("trailing_activated", False)
+                highest = position.get("highest_price", position["entry_price"])
+                trail_stop = highest - Config.ATR_TRAIL_OFFSET * atr if trailing_act else 0
                 open_positions.append({
                     "symbol": symbol,
                     "entry_price": position["entry_price"],
@@ -588,7 +844,13 @@ class MultiTrader:
                     "quantity": position["quantity"],
                     "value": coin_value,
                     "pnl": pnl,
-                    "pnl_pct": pnl_pct
+                    "pnl_pct": pnl_pct,
+                    "atr": atr,
+                    "tp_price": tp_price,
+                    "sl_price": sl_price,
+                    "trailing_activated": trailing_act,
+                    "highest_price": highest,
+                    "trailing_stop": trail_stop
                 })
 
         return {
@@ -596,18 +858,22 @@ class MultiTrader:
             "total_value": total_value,
             "open_positions": open_positions,
             "open_count": len(open_positions),
-            "total_coins": len(self.coins)
+            "total_coins": len(self.coins),
+            "btc_4h_change": self.btc_change
         }
 
 
 # ============================================================
-# TELEGRAM REPORT BUILDER
+# TELEGRAM REPORT BUILDER (v2)
 # ============================================================
 
-def build_report(multi_results: Dict[str, dict], portfolio: dict, trades: Dict[str, dict]) -> str:
+def build_report(multi_results: Dict[str, dict], portfolio: dict,
+                 trades: Dict[str, dict], btc_change: float) -> str:
     lines = []
-    lines.append("📊 <b>Multi-Coin Watch</b>")
+    btc_emoji = "🟢" if btc_change >= 0 else "🔴"
+    lines.append(f"📊 <b>Multi-Coin Watch v2</b>")
     lines.append(f"🕐 {datetime.now().strftime('%H:%M')} — {datetime.now().strftime('%d/%m')}")
+    lines.append(f"{btc_emoji} BTC 4h: {'+' if btc_change >= 0 else ''}{(btc_change*100):.2f}%")
     lines.append("")
 
     for symbol in sorted(multi_results.keys()):
@@ -617,9 +883,9 @@ def build_report(multi_results: Dict[str, dict], portfolio: dict, trades: Dict[s
         action = analysis.get("action", "HOLD")
         rsi = analysis.get("rsi", 50)
         price = analysis.get("price", 0)
+        atr = analysis.get("atr", 0)
         reason = analysis.get("reason", "")
 
-        # Emoji
         if action == "BUY":
             emoji = "🟢"
         elif action == "SELL":
@@ -633,31 +899,39 @@ def build_report(multi_results: Dict[str, dict], portfolio: dict, trades: Dict[s
             pnl_pct = (price - position["entry_price"]) / position["entry_price"] * 100
             pnl_emoji = "🟢" if pnl_pct >= 0 else "🔴"
             pos_info = f" | {pnl_emoji}{pnl_pct:+.1f}%"
+            if atr > 0:
+                tp = position["entry_price"] + Config.ATR_TP_MULT * atr
+                sl = position["entry_price"] - Config.ATR_SL_MULT * atr
+                trailing = "✅" if position.get("trailing_activated") else "⏳"
+                pos_info += f" | TP ${tp:.4f} SL ${sl:.4f} trail:{trailing}"
 
         lines.append(f"{emoji} <b>{symbol}</b> | RSI: {rsi:.0f} | {action}{pos_info}")
         if reason:
             lines.append(f"   {reason}")
 
-        # Trade result
         if symbol in trades:
             t = trades[symbol]
             side = t.get("side", "")
             pnl = t.get("pnl", 0)
+            reason_t = t.get("reason", "")
             if side == "BUY":
-                lines.append(f"   ✅ {side} executado (sim)")
+                lines.append(f"   ✅ {side} (sim) | ATR ${atr:.4f}")
             elif side == "SELL":
-                lines.append(f"   ✅ {side} executado (sim) | PnL: {pnl:+.4f}")
+                lines.append(f"   ✅ {side} (sim) | PnL: {pnl:+.4f} | {reason_t}")
 
         lines.append("")
 
-    # Portfolio summary
-    lines.append("─" * 22)
+    lines.append("─" * 26)
     lines.append(f"💰 Saldo: ${portfolio['total_balance']:.2f}")
     lines.append(f"📦 Posições: {portfolio['open_count']}/{portfolio['total_coins']}")
 
     if portfolio['open_positions']:
         for p in portfolio['open_positions']:
-            lines.append(f"  • {p['symbol']}: LONG @ ${p['entry_price']:.5f} | {p['pnl_pct']:+.1f}%")
+            trailing_str = f" | ⬆️ highest ${p['highest_price']:.4f}" if p.get('trailing_activated') else ""
+            lines.append(
+                f"  • {p['symbol']}: LONG @ ${p['entry_price']:.4f} "
+                f"| {p['pnl_pct']:+.1f}%{trailing_str}"
+            )
 
     return "\n".join(lines)
 
@@ -670,12 +944,11 @@ def main():
     import sys
 
     if len(sys.argv) > 1 and sys.argv[1] == "watch":
-        # Watch mode: analyze all coins, send Telegram, no trades
-        logger.info("=== MULTI-COIN WATCH ===")
+        logger.info("=== MULTI-COIN WATCH v2 ===")
         mt = MultiTrader()
         results = mt.analyze_all()
         portfolio = mt.get_portfolio_status()
-        report = build_report(results, portfolio, {})
+        report = build_report(results, portfolio, {}, mt.btc_change)
         send_telegram_message(report)
         print("✅ Watch report sent to Telegram")
         return
@@ -687,12 +960,12 @@ def main():
         return
 
     # Full trading cycle
-    logger.info("=== MULTI-COIN TRADING CYCLE ===")
+    logger.info("=== MULTI-COIN TRADING CYCLE v2 ===")
     mt = MultiTrader()
     results = mt.analyze_all()
     portfolio = mt.get_portfolio_status()
     trades = mt.execute_all(portfolio["total_balance"])
-    report = build_report(results, portfolio, trades)
+    report = build_report(results, portfolio, trades, mt.btc_change)
     send_telegram_message(report)
     print("✅ Trading cycle complete")
     print(json.dumps({"portfolio": portfolio, "trades": trades}, indent=2, default=str))
