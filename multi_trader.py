@@ -864,74 +864,101 @@ class MultiTrader:
 
 
 # ============================================================
-# TELEGRAM REPORT BUILDER (v2)
+# TELEGRAM REPORT BUILDER (v3 — só envia se BUY ou SELL)
 # ============================================================
 
 def build_report(multi_results: Dict[str, dict], portfolio: dict,
-                 trades: Dict[str, dict], btc_change: float) -> str:
-    lines = []
-    btc_emoji = "🟢" if btc_change >= 0 else "🔴"
-    lines.append(f"📊 <b>Multi-Coin Watch v2</b>")
-    lines.append(f"🕐 {datetime.now().strftime('%H:%M')} — {datetime.now().strftime('%d/%m')}")
-    lines.append(f"{btc_emoji} BTC 4h: {'+' if btc_change >= 0 else ''}{(btc_change*100):.2f}%")
-    lines.append("")
+                 trades: Dict[str, dict], btc_change: float) -> Optional[str]:
+    """
+    Retorna None se não houver nenhuma ação BUY ou SELL.
+    Nesse caso, o Telegram não envia nada (silêncio).
+    """
+    # Coletar ações
+    buy_signals = []
+    sell_signals = []
+    executed_trades = {}
 
     for symbol in sorted(multi_results.keys()):
         result = multi_results[symbol]
         analysis = result["analysis"]
         position = result["position"]
         action = analysis.get("action", "HOLD")
-        rsi = analysis.get("rsi", 50)
         price = analysis.get("price", 0)
-        atr = analysis.get("atr", 0)
+        rsi = analysis.get("rsi", 50)
         reason = analysis.get("reason", "")
 
         if action == "BUY":
-            emoji = "🟢"
+            buy_signals.append({
+                "symbol": symbol, "price": price, "rsi": rsi, "reason": reason
+            })
         elif action == "SELL":
-            emoji = "🔴"
-        else:
-            emoji = "⚪️"
+            sell_signals.append({
+                "symbol": symbol, "price": price, "rsi": rsi, "reason": reason
+            })
 
-        # Position info
-        pos_info = ""
-        if position and position["side"] == "LONG":
-            pnl_pct = (price - position["entry_price"]) / position["entry_price"] * 100
-            pnl_emoji = "🟢" if pnl_pct >= 0 else "🔴"
-            pos_info = f" | {pnl_emoji}{pnl_pct:+.1f}%"
-            if atr > 0:
-                tp = position["entry_price"] + Config.ATR_TP_MULT * atr
-                sl = position["entry_price"] - Config.ATR_SL_MULT * atr
-                trailing = "✅" if position.get("trailing_activated") else "⏳"
-                pos_info += f" | TP ${tp:.4f} SL ${sl:.4f} trail:{trailing}"
-
-        lines.append(f"{emoji} <b>{symbol}</b> | RSI: {rsi:.0f} | {action}{pos_info}")
-        if reason:
-            lines.append(f"   {reason}")
-
+        # Trade executado
         if symbol in trades:
-            t = trades[symbol]
+            executed_trades[symbol] = trades[symbol]
+
+    # Se não tem nada, silêncio
+    if not buy_signals and not sell_signals and not executed_trades:
+        return None
+
+    # --- Montar relatório ---
+    lines = []
+    now = datetime.now()
+    btc_emoji = "🟢" if btc_change >= 0 else "🔴"
+
+    # Header
+    lines.append(f"📊 <b>Multi-Coin Watch</b>  {now.strftime('%d/%m %H:%M')}")
+    lines.append(f"{btc_emoji} BTC {'+' if btc_change >= 0 else ''}{(btc_change*100):.2f}% (4h)")
+
+    # BUY signals
+    if buy_signals:
+        lines.append("")
+        lines.append("🟢 <b>COMPRAS</b>")
+        for s in buy_signals:
+            atr_val = s.get("atr", 0)
+            lines.append(f"  • {s['symbol']} @ ${s['price']:.5f}")
+            lines.append(f"    RSI {s['rsi']:.0f} | {s['reason']}")
+
+    # SELL signals
+    if sell_signals:
+        lines.append("")
+        lines.append("🔴 <b>VENDAS</b>")
+        for s in sell_signals:
+            lines.append(f"  • {s['symbol']} @ ${s['price']:.5f}")
+            lines.append(f"    RSI {s['rsi']:.0f} | {s['reason']}")
+
+    # Executed trades
+    if executed_trades:
+        lines.append("")
+        lines.append("⚡ <b>TRADES EXECUTADOS</b>")
+        for symbol, t in executed_trades.items():
             side = t.get("side", "")
             pnl = t.get("pnl", 0)
+            pnl_pct = t.get("pnl_pct", 0)
             reason_t = t.get("reason", "")
-            if side == "BUY":
-                lines.append(f"   ✅ {side} (sim) | ATR ${atr:.4f}")
-            elif side == "SELL":
-                lines.append(f"   ✅ {side} (sim) | PnL: {pnl:+.4f} | {reason_t}")
+            emoji = "🟢" if side == "BUY" else "🔴"
+            pnl_str = f"{pnl_pct:+.2f}%" if pnl != 0 else ""
+            lines.append(f"  {emoji} {side} {symbol} {pnl_str}")
+            if reason_t:
+                lines.append(f"    {reason_t}")
 
+    # Portfolio summary (só se tiver posições abertas)
+    if portfolio.get("open_positions"):
         lines.append("")
-
-    lines.append("─" * 26)
-    lines.append(f"💰 Saldo: ${portfolio['total_balance']:.2f}")
-    lines.append(f"📦 Posições: {portfolio['open_count']}/{portfolio['total_coins']}")
-
-    if portfolio['open_positions']:
-        for p in portfolio['open_positions']:
-            trailing_str = f" | ⬆️ highest ${p['highest_price']:.4f}" if p.get('trailing_activated') else ""
+        lines.append("💼 <b>Posições Abertas</b>")
+        for p in portfolio["open_positions"]:
+            pnl_emoji = "🟢" if p["pnl_pct"] >= 0 else "🔴"
+            trail = " ⬆️" if p.get("trailing_activated") else ""
             lines.append(
-                f"  • {p['symbol']}: LONG @ ${p['entry_price']:.4f} "
-                f"| {p['pnl_pct']:+.1f}%{trailing_str}"
+                f"  {pnl_emoji} {p['symbol']}: {p['pnl_pct']:+.1f}% "
+                f"(@ ${p['entry_price']:.5f}){trail}"
             )
+
+    lines.append("")
+    lines.append(f"💰 ${portfolio['total_balance']:.2f} | 📦 {portfolio['open_count']}/{portfolio['total_coins']}")
 
     return "\n".join(lines)
 
@@ -944,13 +971,16 @@ def main():
     import sys
 
     if len(sys.argv) > 1 and sys.argv[1] == "watch":
-        logger.info("=== MULTI-COIN WATCH v2 ===")
+        logger.info("=== MULTI-COIN WATCH v3 ===")
         mt = MultiTrader()
         results = mt.analyze_all()
         portfolio = mt.get_portfolio_status()
         report = build_report(results, portfolio, {}, mt.btc_change)
-        send_telegram_message(report)
-        print("✅ Watch report sent to Telegram")
+        if report:
+            send_telegram_message(report)
+            print("✅ Watch report sent to Telegram")
+        else:
+            print("🤐 All HOLD — no message sent (silence mode)")
         return
 
     if len(sys.argv) > 1 and sys.argv[1] == "status":
@@ -960,14 +990,17 @@ def main():
         return
 
     # Full trading cycle
-    logger.info("=== MULTI-COIN TRADING CYCLE v2 ===")
+    logger.info("=== MULTI-COIN TRADING CYCLE v3 ===")
     mt = MultiTrader()
     results = mt.analyze_all()
     portfolio = mt.get_portfolio_status()
     trades = mt.execute_all(portfolio["total_balance"])
     report = build_report(results, portfolio, trades, mt.btc_change)
-    send_telegram_message(report)
-    print("✅ Trading cycle complete")
+    if report:
+        send_telegram_message(report)
+        print("✅ Report sent to Telegram")
+    else:
+        print("🤐 All HOLD — no message sent (silence mode)")
     print(json.dumps({"portfolio": portfolio, "trades": trades}, indent=2, default=str))
 
 
